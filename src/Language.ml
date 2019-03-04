@@ -14,10 +14,10 @@ module State =
     (* State: global state, local state, scope variables *)
     type t = {g : string -> int; l : string -> int; scope : string list}
 
+    let empty_state x = failwith (Printf.sprintf "Undefined variable: %s" x)
     (* Empty state *)
     let empty =
-      let e x = failwith (Printf.sprintf "Undefined variable: %s" x) in
-      {g = e; l = e; scope = []}
+      {g = empty_state; l = empty_state; scope = []}
 
     (* Update: non-destructively "modifies" the state s by binding the variable x 
        to value v and returns the new state w.r.t. a scope
@@ -37,6 +37,8 @@ module State =
 
   end
     
+open Ostap
+       
 (* Simple expressions: syntax and semantics *)
 module Expr =
   struct
@@ -63,6 +65,7 @@ module Expr =
                                                             
     (* Expression evaluator
 
+<<<<<<< HEAD
           val eval : env -> config -> t -> config
 
 
@@ -74,15 +77,58 @@ module Expr =
        which takes an environment (of the same type), a name of the function, a list of actual parameters and a configuration, 
        an returns resulting configuration
     *)                                                       
-    let rec eval env ((st, i, o, r) as conf) expr = failwith "Not implemented"
-         
+    let bool_to_int x = if x then 1 else 0
+    let int_to_bool x = if x == 0 then false else true
+
+    let boolop_with_ret_to_int op = fun lhs rhs -> bool_to_int (op (int_to_bool lhs) (int_to_bool rhs))
+    let boolop_to_int op = fun lhs rhs -> bool_to_int (op lhs rhs)
+
+    let str_to_op op = match op with
+        | "+" -> ( + )
+        | "-" -> ( - )
+        | "*" -> ( * )
+        | "/" -> ( / )
+        | "%" -> ( mod )
+        | "!!" -> boolop_with_ret_to_int ( || )
+        | "&&" -> boolop_with_ret_to_int ( && )
+        | "==" -> boolop_to_int ( == )
+        | "!=" -> boolop_to_int ( != )
+        | "<=" -> boolop_to_int ( <= )
+        | "<" -> boolop_to_int ( < )
+        | ">=" -> boolop_to_int ( >= )
+        | ">" -> boolop_to_int ( > )
+        | _ -> failwith "unsupported op"
+
+
+    let rec eval s e = match e with
+        | Const x -> x
+        | Var n -> State.eval s n
+        | Binop (op, e1, e2) -> let r1 = eval s e1 in
+                                let r2 = eval s e2 in
+                                str_to_op op r1 r2
     (* Expression parser. You can use the following terminals:
 
          IDENT   --- a non-empty identifier a-zA-Z[a-zA-Z0-9_]* as a string
          DECIMAL --- a decimal constant [0-9]+ as a string                                                                                                                  
     *)
-    ostap (                                      
-      parse: empty {failwith "Not implemented"}
+    let to_binop op = ostap($(op)), fun x y -> Binop (op, x, y)
+
+    ostap (
+      expr:
+          !(Util.expr
+               (fun x -> x)
+               (Array.map (fun (assoc, ops) -> assoc, List.map to_binop ops)
+               [|
+                  `Lefta, ["!!"];
+                  `Lefta, ["&&"];
+                  `Nona,  ["<="; ">="; "=="; "!="; ">"; "<";];
+                  `Lefta, ["+"; "-"];
+                  `Lefta, ["*"; "/"; "%"];
+               |])
+               primary
+          );
+      primary: n:DECIMAL {Const n} | x:IDENT {Var x} | -"(" expr -")";
+      parse: expr
     )
     
   end
@@ -100,8 +146,8 @@ module Stmt =
     (* empty statement                  *) | Skip
     (* conditional                      *) | If     of Expr.t * t * t
     (* loop with a pre-condition        *) | While  of Expr.t * t
-    (* loop with a post-condition       *) | Repeat of t * Expr.t
     (* return statement                 *) | Return of Expr.t option
+    (* loop with a post-condition       *) | RepeatUntil of t * Expr.t
     (* call a procedure                 *) | Call   of string * Expr.t list with show
                                                                     
     (* Statement evaluator
@@ -111,11 +157,75 @@ module Stmt =
        Takes an environment, a configuration and a statement, and returns another configuration. The 
        environment is the same as for expressions
     *)
-    let rec eval env ((st, i, o, r) as conf) k stmt = failwith "Not implemnted"
-         
+    let hd_tl l msg = match l with
+        | head::tail -> (head, tail)
+        | _ -> failwith(msg)
+    let reverse_condition cond = Expr.Binop ("==", cond, Expr.Const 0)
+    let rec eval env ((s, i, o) as config) p = match p with
+        | Read name -> let (head, tail) = hd_tl i "Unexpected end of input" in
+                       (State.update name head s, tail, o)
+        | Write e -> (s, i, o @ [Expr.eval s e])
+        | Assign (name, e) -> (State.update name (Expr.eval s e) s, i, o)
+        | Seq (e1, e2) -> let (s1, i1, o1) = eval env config e1 in
+                         eval env (s1, i1, o1) e2
+        | Skip -> config
+        | If (cond, thn, els) -> let cond_value = Expr.eval s cond in
+                                 if cond_value <> 0 then
+                                     eval env config thn
+                                 else
+                                     eval env config els
+        | While (cond, body) -> let cond_value = Expr.eval s cond in
+                                if cond_value == 0 then config
+                                else
+                                    let c' = eval env config body in
+                                    eval env c' (While (cond, body))
+        | RepeatUntil (body, cond) -> let c' = eval env config body in
+                                      eval env c' (While (reverse_condition cond, body))
+        | Call (name, args) ->
+            let (arg_names, locals, body) = env#definition name in
+            let fun_state = State.push_scope s (arg_names @ locals) in
+            let args_values = List.map (Expr.eval s) args in
+            let fun_env_w_args =
+                List.fold_left (fun s (name, value) -> State.update name value s) fun_state
+                               (List.combine arg_names args_values) in
+            let (s', i', o') = eval env (fun_env_w_args, i, o) body in
+            ((State.drop_scope s' s), i', o')
+            
+            
+
     (* Statement parser *)
     ostap (
-      parse: empty {failwith "Not implemented"}
+      stmt: "read" "(" x:IDENT ")" {Read x}
+           | "write" "(" e:!(Expr.parse) ")" {Write e}
+           | x:IDENT ":=" e:!(Expr.parse) {Assign (x, e)}
+           | "if" condition:!(Expr.parse)
+                "then" th:!(parse)
+                elif:(%"elif" !(Expr.parse) %"then" !(parse))*
+                els:(%"else" !(parse))?
+                "fi"
+                {
+                    let else_body = match els with
+                        | Some x -> x
+                        | _ -> Skip
+                    in
+                    let t = List.fold_right (fun (cond, body) curr -> If (cond, body, curr)) elif else_body in
+                    If (condition, th, t)
+                }
+            | "while" condition:!(Expr.parse) "do" body:!(parse) "od" { While (condition, body)}
+            | "for" init:!(parse) "," cond:!(Expr.parse) "," step:!(parse) "do" body:!(parse) "od"
+            {
+                Seq(init, While(cond, Seq(body, step)))
+            }
+            | "repeat" body:!(parse) "until" cond:!(Expr.parse)
+            { 
+                RepeatUntil (body, cond)
+            }
+            | name:IDENT "(" args:(!(Expr.parse))* ")"
+            {
+                Call (name, args)
+            }
+            | "skip" {Skip};
+      parse: st1:stmt ";" st2:parse {Seq (st1, st2)} | stmt
     )
       
   end
@@ -127,8 +237,15 @@ module Definition =
     (* The type for a definition: name, argument list, local variables, body *)
     type t = string * (string list * string list * Stmt.t)
 
-    ostap (     
-      parse: empty {failwith "Not implemented"}
+    ostap (                                      
+      parse: "fun" name:IDENT "(" args:(IDENT)* ")"
+             local:(%"local" (IDENT)*)?
+             "{" body:!(Stmt.parse) "}"
+             { let local = match local with
+                | Some x -> x
+                | _ -> [] in
+             name, (args, local, body)
+             }
     )
 
   end
