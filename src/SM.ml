@@ -24,7 +24,24 @@ type config = int list * Stmt.config
 
    Takes a configuration and a program, and returns a configuration as a result
 *)                         
-let rec eval conf prog = failwith "Not yet implemented"
+let hd_tl = Language.Stmt.hd_tl
+let rec eval (st, (s, i, o)) p = 
+    let eval_expr expr = match expr with
+        | BINOP op -> (match st with
+            | (y::x::xs) -> (Language.Expr.str_to_op op x y :: xs, (s, i, o)) 
+            | _ -> failwith "Stack is empty on binop")
+        | CONST x -> (x :: st, (s, i, o))
+        | READ -> let (head, tail) = hd_tl i "Unexpected end of input" in
+                      (head :: st, (s, tail, o))
+        | WRITE -> let (head, tail) = hd_tl st "Stack is empty on write" in
+                       (tail, (s, i, o @ [head]))
+        | LD name -> (s name :: st, (s, i, o))
+        | ST name -> let (head, tail) = hd_tl st "Stack is empty on store" in
+                     let new_state = Language.Expr.update name head s in
+                     (tail, (new_state, i, o)) in
+    match p with
+        | x::xs -> eval (eval_expr x) xs
+        | _ -> (st, (s, i, o))
 
 (* Top-level evaluation
 
@@ -41,14 +58,13 @@ let run p i = let (_, (_, _, o)) = eval ([], (Expr.empty, i, [])) p in o
    Takes a program in the source language and returns an equivalent program for the
    stack machine
 *)
-let rec compile =
-  let rec expr = function
-  | Expr.Var   x          -> [LD x]
-  | Expr.Const n          -> [CONST n]
-  | Expr.Binop (op, x, y) -> expr x @ expr y @ [BINOP op]
-  in
-  function
-  | Stmt.Seq (s1, s2)  -> compile s1 @ compile s2
-  | Stmt.Read x        -> [READ; ST x]
-  | Stmt.Write e       -> expr e @ [WRITE]
-  | Stmt.Assign (x, e) -> expr e @ [ST x]
+let rec compile_expr e = match e with
+    | Language.Expr.Const x -> [CONST x]
+    | Language.Expr.Var n -> [LD n]
+    | Language.Expr.Binop (op, e1, e2) -> compile_expr e1 @ compile_expr e2 @ [BINOP op]
+
+let rec compile p = match p with
+    | Language.Stmt.Read name -> [READ; ST name]
+    | Language.Stmt.Write expr -> compile_expr expr @ [WRITE]
+    | Language.Stmt.Assign (name, expr) -> compile_expr expr @ [ST name]
+    | Language.Stmt.Seq (e1, e2) -> compile e1 @ compile e2
