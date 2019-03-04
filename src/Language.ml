@@ -36,6 +36,8 @@ module State =
 
   end
     
+open Ostap
+       
 (* Simple expressions: syntax and semantics *)
 module Expr =
   struct
@@ -63,59 +65,59 @@ module Expr =
        Takes a state and an expression, and returns the value of the expression in 
        the given state.
     *)                                                       
-    let to_func op =
-      let bti   = function true -> 1 | _ -> 0 in
-      let itb b = b <> 0 in
-      let (|>) f g   = fun x y -> f (g x y) in
-      match op with
-      | "+"  -> (+)
-      | "-"  -> (-)
-      | "*"  -> ( * )
-      | "/"  -> (/)
-      | "%"  -> (mod)
-      | "<"  -> bti |> (< )
-      | "<=" -> bti |> (<=)
-      | ">"  -> bti |> (> )
-      | ">=" -> bti |> (>=)
-      | "==" -> bti |> (= )
-      | "!=" -> bti |> (<>)
-      | "&&" -> fun x y -> bti (itb x && itb y)
-      | "!!" -> fun x y -> bti (itb x || itb y)
-      | _    -> failwith (Printf.sprintf "Unknown binary operator %s" op)    
-    
-    let rec eval st expr =      
-      match expr with
-      | Const n -> n
-      | Var   x -> State.eval st x
-      | Binop (op, x, y) -> to_func op (eval st x) (eval st y)
+    let bool_to_int x = if x then 1 else 0
+    let int_to_bool x = if x == 0 then false else true
 
+    let boolop_with_ret_to_int op = fun lhs rhs -> bool_to_int (op (int_to_bool lhs) (int_to_bool rhs))
+    let boolop_to_int op = fun lhs rhs -> bool_to_int (op lhs rhs)
+
+    let str_to_op op = match op with
+        | "+" -> ( + )
+        | "-" -> ( - )
+        | "*" -> ( * )
+        | "/" -> ( / )
+        | "%" -> ( mod )
+        | "!!" -> boolop_with_ret_to_int ( || )
+        | "&&" -> boolop_with_ret_to_int ( && )
+        | "==" -> boolop_to_int ( == )
+        | "!=" -> boolop_to_int ( != )
+        | "<=" -> boolop_to_int ( <= )
+        | "<" -> boolop_to_int ( < )
+        | ">=" -> boolop_to_int ( >= )
+        | ">" -> boolop_to_int ( > )
+        | _ -> failwith "unsupported op"
+
+
+    let rec eval s e = match e with
+        | Const x -> x
+        | Var n -> s n
+        | Binop (op, e1, e2) -> let r1 = eval s e1 in
+                                let r2 = eval s e2 in
+                                str_to_op op r1 r2
     (* Expression parser. You can use the following terminals:
 
          IDENT   --- a non-empty identifier a-zA-Z[a-zA-Z0-9_]* as a string
          DECIMAL --- a decimal constant [0-9]+ as a string
                                                                                                                   
     *)
-    ostap (                                      
-      parse:
-	  !(Ostap.Util.expr 
-             (fun x -> x)
-	     (Array.map (fun (a, s) -> a, 
-                           List.map  (fun s -> ostap(- $(s)), (fun x y -> Binop (s, x, y))) s
-                        ) 
-              [|                
-		`Lefta, ["!!"];
-		`Lefta, ["&&"];
-		`Nona , ["=="; "!="; "<="; "<"; ">="; ">"];
-		`Lefta, ["+" ; "-"];
-		`Lefta, ["*" ; "/"; "%"];
-              |] 
-	     )
-	     primary);
-      
-      primary:
-        n:DECIMAL {Const n}
-      | x:IDENT   {Var x}
-      | -"(" parse -")"
+    let to_binop op = ostap($(op)), fun x y -> Binop (op, x, y)
+
+    ostap (
+      expr:
+          !(Util.expr
+               (fun x -> x)
+               (Array.map (fun (assoc, ops) -> assoc, List.map to_binop ops)
+               [|
+                  `Lefta, ["!!"];
+                  `Lefta, ["&&"];
+                  `Nona,  ["<="; ">="; "=="; "!="; ">"; "<";];
+                  `Lefta, ["+"; "-"];
+                  `Lefta, ["*"; "/"; "%"];
+               |])
+               primary
+          );
+      primary: n:DECIMAL {Const n} | x:IDENT {Var x} | -"(" expr -")";
+      parse: expr
     )
     
   end
@@ -133,8 +135,8 @@ module Stmt =
     (* empty statement                  *) | Skip
     (* conditional                      *) | If     of Expr.t * t * t
     (* loop with a pre-condition        *) | While  of Expr.t * t
-    (* loop with a post-condition       *) | Repeat of t * Expr.t
     (* call a procedure                 *) | Call   of string * Expr.t list with show
+    (* loop with a post-condition       *) | RepeatUntil of t * Expr.t  with show
                                                                     
     (* The type of configuration: a state, an input stream, an output stream *)
     type config = State.t * int list * int list 
@@ -150,11 +152,60 @@ module Stmt =
 
        which returns a list of formal parameters and a body for given definition
     *)
-    let rec eval _ = failwith "Not Implemented Yet"
-                                
+    let hd_tl l msg = match l with
+        | head::tail -> (head, tail)
+        | _ -> failwith(msg)
+    let reverse_condition cond = Expr.Binop ("==", cond, Expr.Const 0)
+    let rec eval (s, i, o) p = match p with
+        | Read name -> let (head, tail) = hd_tl i "Unexpected end of input" in
+                       (Expr.update name head s, tail, o)
+        | Write e -> (s, i, o @ [Expr.eval s e])
+        | Assign (name, e) -> (Expr.update name (Expr.eval s e) s, i, o)
+        | Seq (e1, e2) -> let (s1, i1, o1) = eval (s, i, o) e1 in
+                         eval (s1, i1, o1) e2
+        | Skip -> (s, i, o)
+        | If (cond, thn, els) -> let cond_value = Expr.eval s cond in
+                                 if cond_value <> 0 then
+                                     eval (s, i, o) thn
+                                 else
+                                     eval (s, i, o) els
+        | While (cond, body) -> let cond_value = Expr.eval s cond in
+                                if cond_value == 0 then (s, i, o)
+                                else
+                                    let c' = eval (s, i, o) body in
+                                    eval c' (While (cond, body))
+        | RepeatUntil (body, cond) -> let c' = eval (s, i, o) body in
+                                      eval c' (While (reverse_condition cond, body))
+
     (* Statement parser *)
-    ostap (                                      
-      parse: empty {failwith "Not yet implemented"}
+    ostap (
+      stmt: "read" "(" x:IDENT ")" {Read x}
+           | "write" "(" e:!(Expr.parse) ")" {Write e}
+           | x:IDENT ":=" e:!(Expr.parse) {Assign (x, e)}
+           | "if" condition:!(Expr.parse)
+                "then" th:!(parse)
+                elif:(%"elif" !(Expr.parse) %"then" !(parse))*
+                els:(%"else" !(parse))?
+                "fi"
+                {
+                    let else_body = match els with
+                        | Some x -> x
+                        | _ -> Skip
+                    in
+                    let t = List.fold_right (fun (cond, body) curr -> If (cond, body, curr)) elif else_body in
+                    If (condition, th, t)
+                }
+            | "while" condition:!(Expr.parse) "do" body:!(parse) "od" { While (condition, body)}
+            | "for" init:!(parse) "," cond:!(Expr.parse) "," step:!(parse) "do" body:!(parse) "od"
+            {
+                Seq(init, While(cond, Seq(body, step)))
+            }
+            | "repeat" body:!(parse) "until" cond:!(Expr.parse)
+            { 
+                RepeatUntil (body, cond)
+            }
+            | "skip" {Skip};
+      parse: st1:stmt ";" st2:parse {Seq (st1, st2)} | stmt
     )
       
   end
