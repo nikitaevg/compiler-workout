@@ -114,17 +114,23 @@ let compile_binop env op =
     let a,env = env#allocate in
     if op = "+" || op = "-" || op = "*" then
         let res, code = binop_mem_mem (fun x y -> Binop (op, x, y)) lhs rhs in
-        (env,(code @ [Mov(res, a)]))
+        env,code @ [Mov(res, a)]
     else if op_is_cmp op then
         let suff = suffix_for_comparing op in
         let _,code = binop_mem_mem (fun x y -> Binop ("cmp", x, y)) lhs rhs in
-        (env,([Binop ("^", eax, eax)] @ code @ [Set (suff,"%al"); Mov (eax, a)]))
+        env,[Binop ("^", eax, eax)] @ code @ [Set (suff,"%al"); Mov (eax, a)]
     else if op = "/" || op = "%" then
         let src = if op = "/" then eax else edx in
         env,[Mov (rhs, eax); Cltd; IDiv lhs; Mov (src, a)]
-    else if  op = "!!" || op = "&&" then
-        env,[Binop (op, lhs, rhs); Binop ("^", eax, eax); Binop ("cmp", L 0, rhs);
-             Set (suffix_for_comparing "!=", "%rl"); Mov (eax, a)]
+    else if  op = "!!" then
+        let res, code = binop_mem_mem (fun x y -> Binop (op, x, y)) lhs rhs in
+        env, code @ [Binop ("^", eax, eax); Binop ("cmp", L 0, res);
+             Set (suffix_for_comparing "!=", "%al"); Mov (eax, a)]
+    else if op = "&&" then
+        env, [Binop("^", eax, eax); Binop("^", edx, edx); 
+              Binop("cmp", L 0, lhs); Set("ne", "%al"); 
+              Binop("cmp", L 0, rhs); Set("ne", "%dl");
+              Binop("&&", edx, eax); Mov(eax, a)]
     else
         failwith "unsupported binop"
 
