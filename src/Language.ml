@@ -13,10 +13,10 @@ module State =
     (* State: global state, local state, scope variables *)
     type t = {g : string -> int; l : string -> int; scope : string list}
 
+    let empty_state x = failwith (Printf.sprintf "Undefined variable: %s" x)
     (* Empty state *)
     let empty =
-      let e x = failwith (Printf.sprintf "Undefined variable: %s" x) in
-      {g = e; l = e; scope = []}
+      {g = empty_state; l = empty_state; scope = []}
 
     (* Update: non-destructively "modifies" the state s by binding the variable x 
        to value v and returns the new state w.r.t. a scope
@@ -90,7 +90,7 @@ module Expr =
 
     let rec eval s e = match e with
         | Const x -> x
-        | Var n -> s n
+        | Var n -> State.eval s n
         | Binop (op, e1, e2) -> let r1 = eval s e1 in
                                 let r2 = eval s e2 in
                                 str_to_op op r1 r2
@@ -135,8 +135,8 @@ module Stmt =
     (* empty statement                  *) | Skip
     (* conditional                      *) | If     of Expr.t * t * t
     (* loop with a pre-condition        *) | While  of Expr.t * t
+    (* loop with a post-condition       *) | RepeatUntil of t * Expr.t
     (* call a procedure                 *) | Call   of string * Expr.t list with show
-    (* loop with a post-condition       *) | RepeatUntil of t * Expr.t  with show
                                                                     
     (* The type of configuration: a state, an input stream, an output stream *)
     type config = State.t * int list * int list 
@@ -156,26 +156,37 @@ module Stmt =
         | head::tail -> (head, tail)
         | _ -> failwith(msg)
     let reverse_condition cond = Expr.Binop ("==", cond, Expr.Const 0)
-    let rec eval (s, i, o) p = match p with
+    let rec eval env ((s, i, o) as config) p = match p with
         | Read name -> let (head, tail) = hd_tl i "Unexpected end of input" in
-                       (Expr.update name head s, tail, o)
+                       (State.update name head s, tail, o)
         | Write e -> (s, i, o @ [Expr.eval s e])
-        | Assign (name, e) -> (Expr.update name (Expr.eval s e) s, i, o)
-        | Seq (e1, e2) -> let (s1, i1, o1) = eval (s, i, o) e1 in
-                         eval (s1, i1, o1) e2
-        | Skip -> (s, i, o)
+        | Assign (name, e) -> (State.update name (Expr.eval s e) s, i, o)
+        | Seq (e1, e2) -> let (s1, i1, o1) = eval env config e1 in
+                         eval env (s1, i1, o1) e2
+        | Skip -> config
         | If (cond, thn, els) -> let cond_value = Expr.eval s cond in
                                  if cond_value <> 0 then
-                                     eval (s, i, o) thn
+                                     eval env config thn
                                  else
-                                     eval (s, i, o) els
+                                     eval env config els
         | While (cond, body) -> let cond_value = Expr.eval s cond in
-                                if cond_value == 0 then (s, i, o)
+                                if cond_value == 0 then config
                                 else
-                                    let c' = eval (s, i, o) body in
-                                    eval c' (While (cond, body))
-        | RepeatUntil (body, cond) -> let c' = eval (s, i, o) body in
-                                      eval c' (While (reverse_condition cond, body))
+                                    let c' = eval env config body in
+                                    eval env c' (While (cond, body))
+        | RepeatUntil (body, cond) -> let c' = eval env config body in
+                                      eval env c' (While (reverse_condition cond, body))
+        | Call (name, args) ->
+            let (arg_names, locals, body) = env#definition name in
+            let fun_state = State.push_scope s (arg_names @ locals) in
+            let args_values = List.map (Expr.eval s) args in
+            let fun_env_w_args =
+                List.fold_left (fun s (name, value) -> State.update name value s) fun_state
+                               (List.combine arg_names args_values) in
+            let (s', i', o') = eval env (fun_env_w_args, i, o) body in
+            ((State.drop_scope s' s), i', o')
+            
+            
 
     (* Statement parser *)
     ostap (
@@ -204,6 +215,10 @@ module Stmt =
             { 
                 RepeatUntil (body, cond)
             }
+            | name:IDENT "(" args:(!(Expr.parse))* ")"
+            {
+                Call (name, args)
+            }
             | "skip" {Skip};
       parse: st1:stmt ";" st2:parse {Seq (st1, st2)} | stmt
     )
@@ -218,7 +233,14 @@ module Definition =
     type t = string * (string list * string list * Stmt.t)
 
     ostap (                                      
-      parse: empty {failwith "Not yet implemented"}
+      parse: "fun" name:IDENT "(" args:(IDENT)* ")"
+             local:(%"local" (IDENT)*)?
+             "{" body:!(Stmt.parse) "}"
+             { let local = match local with
+                | Some x -> x
+                | _ -> [] in
+             name, (args, local, body)
+             }
     )
 
   end
