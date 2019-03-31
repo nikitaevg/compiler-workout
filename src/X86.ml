@@ -143,6 +143,8 @@ let compile_binop env op =
     else
         failwith "unsupported binop"
 
+let rec init_impl cnt = if cnt < 0 then [] else cnt :: init_impl (cnt - 1)
+let init cnt = List.rev (init_impl (cnt - 1))
           
 let rec compile env p =
     match p with
@@ -166,7 +168,7 @@ let rec compile env p =
                     let (env, args) =
                         List.fold_left (fun (env, args) _ -> 
                             let a, env = env#pop in (env, a::args))
-                        (env, []) (List.init arg_cnt (fun x -> x)) in
+                        (env, []) (init arg_cnt) in
                     let push_args = List.map (fun x -> Push x) args in
                     let (env, get_res) = if flag
                                          then let (a, env) = env#allocate in
@@ -175,12 +177,12 @@ let rec compile env p =
                                               env, [] in
                     env, push_args @ [Call name; Binop ("+", L (arg_cnt * word_size), esp)] @ get_res
             | BEGIN (name, args, locals) -> 
-                    let push_regs = List.map (fun x -> Push (R x)) (List.init num_of_regs (fun x -> x)) in
+                    let push_regs = List.map (fun x -> Push (R x)) (init num_of_regs) in
                     let prolog = [Push ebp; Mov (esp, ebp)] in
                     let env = env#enter name args locals in
                     env, prolog @ push_regs @ [Binop ("-", M ("$" ^ env#lsize), esp)]
             | END ->
-                    let pop_regs = List.map (fun x -> Pop (R x)) (List.rev (List.init num_of_regs (fun x -> x))) in 
+                    let pop_regs = List.map (fun x -> Pop (R x)) (List.rev (init num_of_regs)) in 
                     let meta = [Meta (Printf.sprintf "\t.set %s, %d" env#lsize (env#allocated * word_size))] in
                     let epilogue = [Mov (ebp, esp); Pop ebp; Ret] in
                     env, [Label env#epilogue] @ pop_regs @ epilogue @ meta
@@ -194,7 +196,7 @@ let rec compile env p =
 module S = Set.Make (String)
 
 (* Environment implementation *)
-let make_assoc l = List.combine l (List.init (List.length l) (fun x -> x))
+let make_assoc l = List.combine l (init (List.length l))
                      
 class env =
   object (self)
