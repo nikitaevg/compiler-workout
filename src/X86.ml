@@ -144,7 +144,8 @@ let compile_binop env op =
         failwith "unsupported binop"
 
           
-let rec compile env p = match p with
+let rec compile env p =
+    match p with
     | [] -> env, []
     | x::xs ->
         let new_env,code = match x with
@@ -152,16 +153,43 @@ let rec compile env p = match p with
             | READ -> let a,env' = env#allocate in env',[Call "Lread"; Mov (eax, a)]
             | WRITE -> let a,env' = env#pop in env',[Push a; Call "Lwrite"; Pop eax]
             | LD name -> let a,env' = env#allocate in
-                         let var_name = env#loc name in
-                         env',(mov_mem_mem (M var_name) a)
+                         let var = env#loc name in
+                         env',(mov_mem_mem var a)
             | ST name -> let a,env' = (env#global name)#pop in
-                         let var_name = env#loc name in
-                         env',(mov_mem_mem a (M var_name))
+                         let var = env#loc name in
+                         env',(mov_mem_mem a var)
             | BINOP op -> compile_binop env op
             | LABEL l -> env,[Label l]
             | JMP label -> env,[Jmp label]
             | CJMP (c, l) -> let a,env = env#pop in env,[Binop ("cmp", L 0, a); CJmp (c, l)]
-        in let env',code' = compile new_env xs in env',(code @ code')
+            | CALL (name, arg_cnt, flag) -> 
+                    let (env, args) =
+                        List.fold_left (fun (env, args) _ -> 
+                            let a, env = env#pop in (env, a::args))
+                        (env, []) (List.init arg_cnt (fun x -> x)) in
+                    let push_args = List.map (fun x -> Push x) args in
+                    let (env, get_res) = if flag
+                                         then let (a, env) = env#allocate in
+                                              env, [Mov (eax, a)]
+                                         else
+                                              env, [] in
+                    env, push_args @ [Call name; Binop ("+", L (arg_cnt * word_size), esp)] @ get_res
+            | BEGIN (name, args, locals) -> 
+                    let push_regs = List.map (fun x -> Push (R x)) (List.init num_of_regs (fun x -> x)) in
+                    let prolog = [Push ebp; Mov (esp, ebp)] in
+                    let env = env#enter name args locals in
+                    env, prolog @ push_regs @ [Binop ("-", M ("$" ^ env#lsize), esp)]
+            | END ->
+                    let pop_regs = List.map (fun x -> Pop (R x)) (List.rev (List.init num_of_regs (fun x -> x))) in 
+                    let meta = [Meta (Printf.sprintf "\t.set %s, %d" env#lsize (env#allocated * word_size))] in
+                    let epilogue = [Mov (ebp, esp); Pop ebp; Ret] in
+                    env, [Label env#epilogue] @ pop_regs @ epilogue @ meta
+            | RET flag ->
+                    if flag
+                    then let a,env = env#pop in
+                         env, [Mov (a, eax); Jmp env#epilogue]
+                    else env, [Jmp env#epilogue]
+        in let env',code' = compile new_env xs in env',(code @ code') 
 (* A set of strings *)           
 module S = Set.Make (String)
 
@@ -236,10 +264,11 @@ class env =
 *)
 let genasm (ds, stmt) =
   let stmt = Language.Stmt.Seq (stmt, Language.Stmt.Return (Some (Language.Expr.Const 0))) in
+  let sm_code = SM.compile (ds, stmt) in
   let env, code =
     compile
       (new env)
-      ((LABEL "main") :: (BEGIN ("main", [], [])) :: SM.compile (ds, stmt))
+      ((LABEL "main") :: (BEGIN ("main", [], [])) :: sm_code)
   in
   let data = Meta "\t.data" :: (List.map (fun s -> Meta (s ^ ":\t.int\t0")) env#globals) in 
   let asm = Buffer.create 1024 in

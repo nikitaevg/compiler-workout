@@ -7,6 +7,10 @@ open GT
 open Ostap
 open Combinators
                          
+let option_to_list x = match x with
+    | Some y -> y
+    | None -> []
+
 (* States *)
 module State =
   struct
@@ -65,7 +69,6 @@ module Expr =
                                                             
     (* Expression evaluator
 
-<<<<<<< HEAD
           val eval : env -> config -> t -> config
 
 
@@ -100,12 +103,17 @@ module Expr =
         | _ -> failwith "unsupported op"
 
 
-    let rec eval s e = match e with
-        | Const x -> x
-        | Var n -> State.eval s n
-        | Binop (op, e1, e2) -> let r1 = eval s e1 in
-                                let r2 = eval s e2 in
-                                str_to_op op r1 r2
+    let rec eval env ((s, i, o, _) as config) e = match e with
+        | Const x -> (s, i, o, Some x)
+        | Var n -> (s, i, o, Some State.eval s n)
+        | Binop (op, e1, e2) -> let (s, i, o, Some r1) = eval env config e1 in
+                                let (s, i, o, Some r2) = eval env (s, i, o, None) e2 in
+                                (s, i, o, Some str_to_op op r1 r2)
+        | Call (f, args) ->
+                let (s, i, o, args) = List.fold_left (fun (s, i, o, args) arg ->
+                                                        let (s, i, o, Some res) = eval env (s, i, o, None) arg in
+                                                        (s, i, o, args @ [res])) (s, i, o, []) args in
+                env#definition env f args (s, i, o, None)
     (* Expression parser. You can use the following terminals:
 
          IDENT   --- a non-empty identifier a-zA-Z[a-zA-Z0-9_]* as a string
@@ -127,7 +135,8 @@ module Expr =
                |])
                primary
           );
-      primary: n:DECIMAL {Const n} | x:IDENT {Var x} | -"(" expr -")";
+      primary: n:DECIMAL {Const n} | -"(" expr -")"
+             | name:IDENT p:("(" args:!(Util.list0 parse) ")" {Call (name, args)} | empty {Var name}) {p};
       parse: expr
     )
     
@@ -160,36 +169,41 @@ module Stmt =
     let hd_tl l msg = match l with
         | head::tail -> (head, tail)
         | _ -> failwith(msg)
+    let meta x y = match x with
+        | Skip -> y
+        | _ -> match y with
+            | Skip -> x
+            | _ -> Seq (x, y)
     let reverse_condition cond = Expr.Binop ("==", cond, Expr.Const 0)
-    let rec eval env ((s, i, o) as config) p = match p with
+    let rec eval env ((s, i, o, _) as config) k p =
+        (*
+            Printf.printf "CURR - %s\n" (GT.transform(t) (new @t[show]) () p);
+            Printf.printf "KONT - %s\n\n" (GT.transform(t) (new @t[show]) () k);
+        *)
+        match p with
         | Read name -> let (head, tail) = hd_tl i "Unexpected end of input" in
-                       (State.update name head s, tail, o)
-        | Write e -> (s, i, o @ [Expr.eval s e])
-        | Assign (name, e) -> (State.update name (Expr.eval s e) s, i, o)
-        | Seq (e1, e2) -> let (s1, i1, o1) = eval env config e1 in
-                         eval env (s1, i1, o1) e2
-        | Skip -> config
-        | If (cond, thn, els) -> let cond_value = Expr.eval s cond in
+                       eval env (State.update name head s, tail, o, None) Skip k
+        | Write e -> let (s, i, o, Some r) = Expr.eval env config e in
+                     eval env (s, i, o @ [r], None) Skip k
+        | Assign (name, e) -> let (s, i, o, Some r) = Expr.eval env config e in
+                              eval env (State.update name r s, i, o, Some r) Skip k
+        | Seq (e1, e2) -> eval env config (meta e2 k) e1
+        | Skip -> (match k with
+            | Skip -> config
+            | _ -> eval env config Skip k)
+        | If (cond, thn, els) -> let ((s, i, o, Some cond_value) as c) = Expr.eval env config cond in
                                  if cond_value <> 0 then
-                                     eval env config thn
+                                     eval env c k thn
                                  else
-                                     eval env config els
-        | While (cond, body) -> let cond_value = Expr.eval s cond in
-                                if cond_value == 0 then config
-                                else
-                                    let c' = eval env config body in
-                                    eval env c' (While (cond, body))
-        | RepeatUntil (body, cond) -> let c' = eval env config body in
-                                      eval env c' (While (reverse_condition cond, body))
-        | Call (name, args) ->
-            let (arg_names, locals, body) = env#definition name in
-            let fun_state = State.push_scope s (arg_names @ locals) in
-            let args_values = List.map (Expr.eval s) args in
-            let fun_env_w_args =
-                List.fold_left (fun s (name, value) -> State.update name value s) fun_state
-                               (List.combine arg_names args_values) in
-            let (s', i', o') = eval env (fun_env_w_args, i, o) body in
-            ((State.drop_scope s' s), i', o')
+                                     eval env c k els
+        | While (cond, body) -> let ((s, i, o, Some cond_value) as c) = Expr.eval env config cond in
+                                if cond_value == 0 then eval env c Skip k
+                                else eval env c (meta p k) body
+        | RepeatUntil (body, cond) -> eval env config (meta (While (reverse_condition cond, body)) k) body
+        | Call (name, args) -> eval env (Expr.eval env config (Expr.Call (name, args))) Skip k
+        | Return x -> (match x with
+            | Some x -> Expr.eval env config x
+            | _ -> config)
             
             
 
@@ -220,11 +234,12 @@ module Stmt =
             { 
                 RepeatUntil (body, cond)
             }
-            | name:IDENT "(" args:(!(Expr.parse))* ")"
+            | name:IDENT "(" args:!(Util.list0 Expr.parse) ")"
             {
                 Call (name, args)
             }
-            | "skip" {Skip};
+            | "skip" {Skip}
+            | "return" expr:!(Expr.parse)? { Return expr };
       parse: st1:stmt ";" st2:parse {Seq (st1, st2)} | stmt
     )
       
@@ -238,13 +253,12 @@ module Definition =
     type t = string * (string list * string list * Stmt.t)
 
     ostap (                                      
-      parse: "fun" name:IDENT "(" args:(IDENT)* ")"
-             local:(%"local" (IDENT)*)?
+      arg : IDENT;
+      parse: "fun" name:IDENT "(" args:!(Util.list0 arg) ")"
+             local:(%"local" !(Util.list arg))?
              "{" body:!(Stmt.parse) "}"
-             { let local = match local with
-                | Some x -> x
-                | _ -> [] in
-             name, (args, local, body)
+             {
+             name, (args, option_to_list(local), body)
              }
     )
 
@@ -269,7 +283,8 @@ let eval (defs, body) i =
       (object
          method definition env f args (st, i, o, r) =                                                                      
            let xs, locs, s      =  snd @@ M.find f m in
-           let st'              = List.fold_left (fun st (x, a) -> State.update x a st) (State.enter st (xs @ locs)) (List.combine xs args) in
+           let st'              = List.fold_left (fun st (x, a) -> State.update x a st)
+                                                 (State.enter st (xs @ locs)) (List.combine xs args) in
            let st'', i', o', r' = Stmt.eval env (st', i, o, r) Stmt.Skip s in
            (State.leave st'' st, i', o', r')
        end)

@@ -36,7 +36,8 @@ let rec eval env ((cstack, stack, ((st, i, o) as c)) as conf) prg = failwith "No
 *)                         
 let hd_tl = Language.Stmt.hd_tl
 let cjmp_sat znz value = if (znz = "nz" && value <> 0) || (znz = "z" && value == 0) then true else false
-let rec eval env (callstack, stack, ((s, i, o) as config)) p = if 1 == 0 then (callstack, stack, config) else
+let rec eval env (callstack, stack, ((s, i, o) as config)) p =
+    if 1 == 0 then (callstack, stack, config) else
     let eval_expr expr = match expr with
         | BINOP op -> (match stack with
             | (y::x::xs) -> (Language.Expr.str_to_op op x y :: xs, config) 
@@ -50,8 +51,8 @@ let rec eval env (callstack, stack, ((s, i, o) as config)) p = if 1 == 0 then (c
         | ST name -> let (head, tail) = hd_tl stack "Stack is empty on store" in
                      let new_state = Language.State.update name head s in
                      (tail, (new_state, i, o))
-        | BEGIN (arg_names, locals) ->
-                let fun_state = Language.State.push_scope s (arg_names @ locals) in
+        | BEGIN (_, arg_names, locals) ->
+                let fun_state = Language.State.enter s (arg_names @ locals) in
                 let new_state, stack_left =
                     List.fold_left (fun (s, x::stack) name -> (State.update name x s, stack))
                          (fun_state, stack) arg_names in
@@ -65,10 +66,10 @@ let rec eval env (callstack, stack, ((s, i, o) as config)) p = if 1 == 0 then (c
                 if cjmp_sat znz head
                 then eval env (callstack, tail, config) (env#labeled label)
                 else eval env (callstack, tail, config) xs
-            | CALL f -> eval env ((xs, s)::callstack, stack, config) (env#labeled f)
-            | END -> (match callstack with
+            | CALL (f, _, _) -> eval env ((xs, s)::callstack, stack, config) (env#labeled f)
+            | RET _ | END -> (match callstack with
                 | (p, old_s)::callstack' ->
-                    let new_state = Language.State.drop_scope s old_s in
+                    let new_state = Language.State.leave s old_s in
                     eval env (callstack', stack, (new_state, i, o)) p
                 | _ -> (callstack, stack, config)
                 )
@@ -108,11 +109,13 @@ class labels =
     method get_label = {< label_n = label_n + 1 >}, self#generate_label
     method generate_label = "label" ^ string_of_int label_n
   end
-
 let rec compile_expr e = match e with
     | Language.Expr.Const x -> [CONST x]
     | Language.Expr.Var n -> [LD n]
     | Language.Expr.Binop (op, e1, e2) -> compile_expr e1 @ compile_expr e2 @ [BINOP op]
+    | Language.Expr.Call (f, args) ->
+            let compile_args = List.concat (List.map (compile_expr) (List.rev args)) in
+            compile_args @ [CALL (f, List.length args, true)]
 
 let rec compile_impl lb p after_label = match p with
     | Language.Stmt.Read name -> ([READ; ST name]), false, lb
@@ -148,7 +151,10 @@ let rec compile_impl lb p after_label = match p with
         List.tl (prg), false, lb
     | Language.Stmt.Call (f, args) -> 
         let compile_args = List.concat (List.map (compile_expr) (List.rev args)) in
-        compile_args @ [CALL f], false, lb
+        compile_args @ [CALL (f, List.length args, false)], false, lb
+    | Language.Stmt.Return expr -> (match expr with
+                                    | Some x -> (compile_expr x) @ [RET true]
+                                    | _ -> [RET false]), false, lb
         
 
 let top_compile lb p = 
@@ -159,7 +165,7 @@ let top_compile lb p =
 let compile_defs lb defs =
     List.fold_left (fun (lb, prg) (name, (args, locals, body)) -> 
         let (lb, body) = top_compile lb body in
-        lb, prg @ [LABEL name] @ [BEGIN (args, locals)] @ body @ [END]) (lb, []) defs
+        lb, prg @ [LABEL name] @ [BEGIN (name, args, locals)] @ body @ [END]) (lb, []) defs
 
 let rec compile (defs, main) =
     let lb = new labels in
