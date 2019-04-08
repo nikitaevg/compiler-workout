@@ -152,8 +152,6 @@ let rec compile env p =
     | x::xs ->
         let new_env,code = match x with
             | CONST x -> let a,env' = env#allocate in env',[Mov (L x, a)]
-            | READ -> let a,env' = env#allocate in env',[Call "Lread"; Mov (eax, a)]
-            | WRITE -> let a,env' = env#pop in env',[Push a; Call "Lwrite"; Pop eax]
             | LD name -> let a,env' = env#allocate in
                          let var = env#loc name in
                          env',(mov_mem_mem var a)
